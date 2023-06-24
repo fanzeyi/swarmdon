@@ -119,7 +119,7 @@ where
 
 fn set_cookie(signing_key: &[u8; 32], key: &'static str, value: String) -> Result<SetCookie> {
     let encoded = format!(
-        "{}={}; Path=/; Max-Age=604800; Secure; HttpOnly; SameSite=Strict",
+        "{}={}; Path=/; Max-Age=604800; Secure; SameSite=Strict",
         key,
         encode_cookie(signing_key, key, value)
     );
@@ -421,7 +421,7 @@ async fn post_swarm_push(
         .to_string()
         .map(|c| format!(" in {}", c))
         .unwrap_or_default();
-    let url = format!("https://www.swarmapp.com/c/{}", checkin.id);
+    let url = format!("https://www.swarmapp.com/checkin/{}", checkin.id);
     let status = if let Some(shout) = checkin.shout {
         format!("{} (@ {}{}) {}", shout, checkin.venue.name, country, url)
     } else {
