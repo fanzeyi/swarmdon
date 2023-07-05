@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::Query;
 use axum::headers::Cookie;
 use axum::headers::Header;
@@ -25,6 +25,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use simple_cookie::decode_cookie;
 use simple_cookie::encode_cookie;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod model;
@@ -48,6 +52,9 @@ struct Flags {
 
     #[clap(long)]
     swarm_client_secret: String,
+
+    #[clap(long)]
+    swarm_push_secret: String,
 }
 
 impl Flags {
@@ -175,11 +182,11 @@ async fn get_mastodon_callback(
         return Err("missing code".into());
     };
 
-    let Some(instance_url) = get_cookie(dbg!(&cookie), &state.signing_key, "instance_url") else {
+    let Some(instance_url) = get_cookie(&cookie, &state.signing_key, "instance_url") else {
         return Err("missing instance_url cookie".into());
     };
 
-    let Ok(Some(registration)) = dbg!(state.db.get_registration(dbg!(&instance_url))) else {
+    let Ok(Some(registration)) = state.db.get_registration(&instance_url) else {
         return Err("missing registration".into());
     };
     let registered = registration.into_registered().from_err()?;
@@ -216,10 +223,10 @@ async fn get_swarm(
     State(state): State<Arc<AppState>>,
     TypedHeader(cookie): TypedHeader<Cookie>,
 ) -> Result<Redirect, String> {
-    let Some(user_id) = dbg!(get_cookie(&dbg!(cookie), &state.signing_key, "user")) else {
+    let Some(user_id) = get_cookie(&cookie, &state.signing_key, "user") else {
         return Err("missing user cookie".into());
     };
-    let Some((instance_url, mastodon_id)) = dbg!(user_id.split_once('|')) else {
+    let Some((instance_url, mastodon_id)) = user_id.split_once('|') else {
         return Err("invalid user cookie".into());
     };
     let Ok(_user) = state.db.get_mastodon_user(instance_url, mastodon_id) else {
@@ -255,11 +262,7 @@ async fn swarm_get_access_token(
         queries.append_pair("client_id", client_id);
         queries.append_pair("client_secret", client_secret);
         queries.append_pair("grant_type", "authorization_code");
-        queries.append_pair(
-            "redirect_uri",
-            redirect_url,
-            // &format!("{}/swarm/callback", state.flags.base_url),
-        );
+        queries.append_pair("redirect_uri", redirect_url);
         queries.append_pair("code", code);
     }
 
@@ -281,25 +284,31 @@ struct SwarmUser {
     last_name: String,
 }
 
-async fn swarm_get_me(access_token: &str) -> Result<SwarmUser> {
+async fn swarm_api(method: String, access_token: &str) -> Result<serde_json::Value> {
     let url = format!(
-        "https://api.foursquare.com/v2/users/self?v=20220722&oauth_token={}",
-        access_token
+        "https://api.foursquare.com/v2{}?v=20220722&oauth_token={}",
+        method, access_token
     );
 
     let response = reqwest::get(url).await?;
     let mut response = response.json::<serde_json::Value>().await?;
-    let Some(mut response) = response
+    let Some(response) = response
         .get_mut("response")
         .map(|v| v.take()) else {
             return Err(anyhow::anyhow!("unable to retrieve response for swarm"));
         };
+    Ok(response)
+}
+
+async fn swarm_get_me(access_token: &str) -> Result<SwarmUser> {
+    let mut response = swarm_api(format!("/users/self"), access_token)
+        .await
+        .with_context(|| format!("unable to retrieve information about the user"))?;
     let response = response
         .get_mut("user")
         .take()
         .ok_or_else(|| anyhow::anyhow!("unable to retrieve user info for swarm"))?
         .take();
-
     Ok(serde_json::from_value(response)?)
 }
 
@@ -311,10 +320,10 @@ async fn get_swarm_callback(
     let Some(code) = params.get("code") else {
         return Err("missing code".into());
     };
-    let Some(user_id) = dbg!(get_cookie(&dbg!(cookie), &state.signing_key, "user")) else {
+    let Some(user_id) = get_cookie(&cookie, &state.signing_key, "user") else {
         return Err("missing user cookie".into());
     };
-    let Some((instance_url, mastodon_id)) = dbg!(user_id.split_once('|')) else {
+    let Some((instance_url, mastodon_id)) = user_id.split_once('|') else {
         return Err("invalid user cookie".into());
     };
     let Ok(Some(mut user)) = state.db.get_mastodon_user(instance_url, mastodon_id) else {
@@ -329,8 +338,10 @@ async fn get_swarm_callback(
     )
     .await
     .from_err()?;
+    tracing::debug!(?access_token, "swarm access token");
 
     let swarm_user = swarm_get_me(&access_token).await.from_err()?;
+    tracing::debug!(?swarm_user, "swarm user");
     user.swarm_id = swarm_user.id.clone();
     user.swarm_access_token = access_token;
     state
@@ -393,16 +404,50 @@ struct SwarmCheckin {
 }
 
 #[derive(Deserialize, Debug)]
+struct SwarmCheckinDetail {
+    #[serde(flatten)]
+    basic: SwarmCheckin,
+
+    #[serde(rename = "checkinShortUrl")]
+    checkin_short_url: String,
+}
+
+#[derive(Deserialize, Debug)]
 struct SwarmPush {
     checkin: String,
+    secret: String,
+}
+
+async fn get_checkin_details(access_token: &str, checkin_id: &str) -> Result<SwarmCheckinDetail> {
+    let mut response = swarm_api(format!("/checkins/{}", checkin_id), access_token).await?;
+    let response = response
+        .get_mut("checkin")
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("response from Swarm API does not contain checkin"))?
+        .take();
+
+    Ok(serde_json::from_value(response)?)
 }
 
 async fn post_swarm_push(
     State(state): State<Arc<AppState>>,
-    Form(SwarmPush { checkin }): Form<SwarmPush>,
+    Form(SwarmPush { checkin, secret }): Form<SwarmPush>,
 ) -> Result<(), String> {
-    let checkin: SwarmCheckin = serde_json::from_str(&checkin).from_err()?;
+    tracing::debug!(%checkin, "received push event");
+    if secret != state.flags.swarm_push_secret {
+        tracing::warn!(%checkin, "received invalid push event");
+        return Ok(());
+    }
+
+    let checkin: SwarmCheckin = match serde_json::from_str(&checkin) {
+        Ok(checkin) => checkin,
+        Err(e) => {
+            tracing::warn!(%checkin, ?e, "unable to parse the checkin push");
+            return Ok(());
+        }
+    };
     if checkin.private.unwrap_or(false) {
+        tracing::info!(checkin=%checkin.id, "checkin is private, skip posting.");
         return Ok(());
     }
     let Ok(Some(user_id)) = state.db.swarm_mapping.get(&checkin.user.id) else {
@@ -421,12 +466,24 @@ async fn post_swarm_push(
         .to_string()
         .map(|c| format!(" in {}", c))
         .unwrap_or_default();
-    let url = format!("https://www.swarmapp.com/checkin/{}", checkin.id);
+
+    let details = match get_checkin_details(&user.swarm_access_token, &checkin.id).await {
+        Ok(details) => details,
+        Err(e) => {
+            tracing::warn!(?checkin, ?e, "unable to retrieve checkin details");
+            return Ok(());
+        }
+    };
+
+    let url = details.checkin_short_url;
     let status = if let Some(shout) = checkin.shout {
         format!("{} (@ {}{}) {}", shout, checkin.venue.name, country, url)
     } else {
-        format!("I'm at {}{} {}", checkin.venue.name, country, url)
+        tracing::info!("no shout for checkin {}, skip posting.", checkin.id);
+        return Ok(());
     };
+
+    tracing::debug!(checkin=%checkin.id, %status, "posting status");
 
     if let Err(e) = mastodon
         .new_status(NewStatus {
@@ -442,7 +499,10 @@ async fn post_swarm_push(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
 
     let flags = Flags::parse();
     let address = flags.address.clone();
@@ -462,7 +522,7 @@ async fn main() {
         .route("/swarm/push", post(post_swarm_push))
         .with_state(state);
 
-    eprintln!("Going to listen at http://{}", address);
+    tracing::info!("Going to listen at http://{}", address);
 
     axum::Server::bind(&address.parse().unwrap())
         .serve(app.into_make_service())
