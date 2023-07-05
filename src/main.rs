@@ -119,7 +119,7 @@ where
 
 fn set_cookie(signing_key: &[u8; 32], key: &'static str, value: String) -> Result<SetCookie> {
     let encoded = format!(
-        "{}={}; Path=/; Max-Age=604800; Secure; SameSite=Strict",
+        "{}={}; Path=/; HttpOnly; Max-Age=604800; Secure",
         key,
         encode_cookie(signing_key, key, value)
     );
