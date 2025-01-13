@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
@@ -55,6 +56,9 @@ struct Flags {
 
     #[clap(long)]
     swarm_push_secret: String,
+
+    #[clap(long)]
+    friends_map: Option<PathBuf>,
 }
 
 impl Flags {
@@ -75,6 +79,7 @@ struct AppState {
     flags: Flags,
     db: model::Database,
     signing_key: [u8; 32],
+    friends_map: HashMap<String, String>,
 }
 
 async fn get_home() -> Html<&'static str> {
@@ -430,7 +435,7 @@ async fn get_checkin_details(access_token: &str, checkin_id: &str) -> Result<Swa
     Ok(serde_json::from_value(response)?)
 }
 
-fn get_shout(checkin: &SwarmCheckin) -> Option<String> {
+fn get_shout(checkin: &SwarmCheckin, friends_map: &HashMap<String, String>) -> Option<String> {
     let shout = checkin.shout.clone();
     if checkin.with.is_empty() {
         return shout;
@@ -453,7 +458,20 @@ fn get_shout(checkin: &SwarmCheckin) -> Option<String> {
     if stripped.is_empty() {
         None
     } else {
-        Some(shout)
+        let names = checkin
+            .with
+            .iter()
+            .map(|user| {
+                if let Some(mastodon_id) = friends_map.get(&user.handle) {
+                    format!("@{}", mastodon_id)
+                } else {
+                    user.first_name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!("{} with {}", stripped, names))
     }
 }
 
@@ -510,7 +528,7 @@ async fn post_swarm_push(
     };
 
     let url = details.checkin_short_url;
-    let status = if let Some(shout) = get_shout(&checkin) {
+    let status = if let Some(shout) = get_shout(&checkin, &state.friends_map) {
         format!("{} (@ {}{}) {}", shout, checkin.venue.name, country, url)
     } else {
         tracing::info!("no shout for checkin {}, skip posting.", checkin.id);
@@ -531,6 +549,16 @@ async fn post_swarm_push(
     Ok(())
 }
 
+fn read_friends_map(path: &Path) -> Result<HashMap<String, String>> {
+    let content = std::fs::read_to_string(path).context("unable to read friends map")?;
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let (swarm_id, mastodon_id) = line.split_once('=').context("invalid line")?;
+        map.insert(swarm_id.to_string(), mastodon_id.to_string());
+    }
+    Ok(map)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -541,11 +569,23 @@ async fn main() {
     let flags = Flags::parse();
     let address = flags.address.clone();
     let database = flags.database.clone();
+    let friends_map = if let Some(friends_map) = flags.friends_map.as_ref() {
+        match read_friends_map(friends_map) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(?e, "unable to read friends map");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
 
     let state = Arc::new(AppState {
         flags,
         db: model::Database::open(&database).unwrap(),
         signing_key: simple_cookie::generate_signing_key(),
+        friends_map,
     });
 
     let app = Router::new()
@@ -620,7 +660,7 @@ fn test_get_shout() {
     )
     .unwrap();
 
-    let shout = get_shout(&checkin);
+    let shout = get_shout(&checkin, &HashMap::new());
     assert_eq!(shout, None);
 }
 
@@ -639,13 +679,13 @@ fn test_get_shout_with_content() {
       "id": "123",
       "firstName": "Alex",
       "lastName": "A",
-      "handle": ""
+      "handle": "alex"
     },
     {
       "id": "123",
       "firstName": "Bob",
       "lastName": "B",
-      "handle": ""
+      "handle": "bob"
     }
   ],
   "editableUntil": 1736735702000,
@@ -680,9 +720,16 @@ fn test_get_shout_with_content() {
     )
     .unwrap();
 
-    let shout = get_shout(&checkin);
+    let shout = get_shout(&checkin, &HashMap::new());
     assert_eq!(
         shout,
         Some("with this is a test with Alex, Bob".to_string())
+    );
+    let mut friends_map = HashMap::new();
+    friends_map.insert("alex".to_string(), "alex@example.com".to_string());
+    let shout = get_shout(&checkin, &friends_map);
+    assert_eq!(
+        shout,
+        Some("with this is a test with @alex@example.com, Bob".to_string())
     );
 }

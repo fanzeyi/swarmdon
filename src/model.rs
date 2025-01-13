@@ -3,13 +3,11 @@ use std::path::Path;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
-use mastodon_async::entities::instance;
 use mastodon_async::registration::Registered;
 use mastodon_async::Data;
 use mastodon_async::Mastodon;
 use serde::Deserialize;
 use serde::Serialize;
-use url::Url;
 
 pub struct Database {
     db: sled::Db,
