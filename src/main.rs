@@ -282,6 +282,7 @@ struct SwarmUser {
     id: String,
     first_name: String,
     last_name: String,
+    handle: String,
 }
 
 async fn swarm_api(method: String, access_token: &str) -> Result<serde_json::Value> {
@@ -292,11 +293,9 @@ async fn swarm_api(method: String, access_token: &str) -> Result<serde_json::Val
 
     let response = reqwest::get(url).await?;
     let mut response = response.json::<serde_json::Value>().await?;
-    let Some(response) = response
-        .get_mut("response")
-        .map(|v| v.take()) else {
-            return Err(anyhow::anyhow!("unable to retrieve response for swarm"));
-        };
+    let Some(response) = response.get_mut("response").map(|v| v.take()) else {
+        return Err(anyhow::anyhow!("unable to retrieve response for swarm"));
+    };
     Ok(response)
 }
 
@@ -401,6 +400,8 @@ struct SwarmCheckin {
     shout: Option<String>,
     user: SwarmUser,
     venue: SwarmVenue,
+    #[serde(default)]
+    with: Vec<SwarmUser>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -429,6 +430,33 @@ async fn get_checkin_details(access_token: &str, checkin_id: &str) -> Result<Swa
     Ok(serde_json::from_value(response)?)
 }
 
+fn get_shout(checkin: &SwarmCheckin) -> Option<String> {
+    let shout = checkin.shout.clone();
+    if checkin.with.is_empty() {
+        return shout;
+    }
+
+    let Some(shout) = shout else {
+        return None;
+    };
+
+    // Attempt to check if the shout actually contains something
+    let names = checkin
+        .with
+        .iter()
+        .map(|user| user.first_name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let with_names = format!("with {}", names);
+
+    let stripped = shout.trim_end_matches(&with_names).trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(shout)
+    }
+}
+
 async fn post_swarm_push(
     State(state): State<Arc<AppState>>,
     Form(SwarmPush { checkin, secret }): Form<SwarmPush>,
@@ -451,11 +479,17 @@ async fn post_swarm_push(
         return Ok(());
     }
     let Ok(Some(user_id)) = state.db.swarm_mapping.get(&checkin.user.id) else {
-        tracing::warn!(user_id=checkin.user.id, "received push event for unknown user");
+        tracing::warn!(
+            user_id = checkin.user.id,
+            "received push event for unknown user"
+        );
         return Ok(());
     };
     let Ok(Some(user)) = state.db.get_user(String::from_utf8_lossy(&user_id)) else {
-        tracing::warn!(user_id=checkin.user.id, "received push event for unknown user");
+        tracing::warn!(
+            user_id = checkin.user.id,
+            "received push event for unknown user"
+        );
         return Ok(());
     };
     let mastodon = user.get_mastodon();
@@ -476,7 +510,7 @@ async fn post_swarm_push(
     };
 
     let url = details.checkin_short_url;
-    let status = if let Some(shout) = checkin.shout {
+    let status = if let Some(shout) = get_shout(&checkin) {
         format!("{} (@ {}{}) {}", shout, checkin.venue.name, country, url)
     } else {
         tracing::info!("no shout for checkin {}, skip posting.", checkin.id);
@@ -528,4 +562,127 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+}
+
+#[test]
+fn test_get_shout() {
+    let checkin: SwarmCheckin = serde_json::from_str(
+        r#"{
+  "id": "123",
+  "createdAt": 1234,
+  "type": "checkin",
+  "visibility": "closeFriends",
+  "shout": "with Alex, Bob",
+  "timeZoneOffset": -480,
+  "with": [
+    {
+      "id": "123",
+      "firstName": "Alex",
+      "lastName": "A",
+      "handle": ""
+    },
+    {
+      "id": "123",
+      "firstName": "Bob",
+      "lastName": "B",
+      "handle": ""
+    }
+  ],
+  "editableUntil": 1736735702000,
+  "user": {
+    "id": "123",
+    "firstName": "Rice",
+    "lastName": "R",
+    "handle": "fanzeyi"
+  },
+  "venue": {
+    "id": "123",
+    "name": "A Place",
+    "contact": {},
+    "location": {
+      "address": "123 A St",
+      "lat": 1,
+      "lng": -1,
+      "postalCode": "10000",
+      "cc": "US",
+      "city": "New York",
+      "state": "NY",
+      "country": "United States"
+    },
+    "categories": [],
+    "verified": false,
+    "stats": { "tipCount": 0, "usersCount": 1, "checkinsCount": 1 },
+    "allowMenuUrlEdit": true,
+    "beenHere": { "lastCheckinExpiredAt": 0 },
+    "createdAt": 1700966000
+  }
+}"#,
+    )
+    .unwrap();
+
+    let shout = get_shout(&checkin);
+    assert_eq!(shout, None);
+}
+
+#[test]
+fn test_get_shout_with_content() {
+    let checkin: SwarmCheckin = serde_json::from_str(
+        r#"{
+  "id": "123",
+  "createdAt": 1234,
+  "type": "checkin",
+  "visibility": "closeFriends",
+  "shout": "with this is a test with Alex, Bob",
+  "timeZoneOffset": -480,
+  "with": [
+    {
+      "id": "123",
+      "firstName": "Alex",
+      "lastName": "A",
+      "handle": ""
+    },
+    {
+      "id": "123",
+      "firstName": "Bob",
+      "lastName": "B",
+      "handle": ""
+    }
+  ],
+  "editableUntil": 1736735702000,
+  "user": {
+    "id": "123",
+    "firstName": "Rice",
+    "lastName": "R",
+    "handle": "fanzeyi"
+  },
+  "venue": {
+    "id": "123",
+    "name": "A Place",
+    "contact": {},
+    "location": {
+      "address": "123 A St",
+      "lat": 1,
+      "lng": -1,
+      "postalCode": "10000",
+      "cc": "US",
+      "city": "New York",
+      "state": "NY",
+      "country": "United States"
+    },
+    "categories": [],
+    "verified": false,
+    "stats": { "tipCount": 0, "usersCount": 1, "checkinsCount": 1 },
+    "allowMenuUrlEdit": true,
+    "beenHere": { "lastCheckinExpiredAt": 0 },
+    "createdAt": 1700966000
+  }
+}"#,
+    )
+    .unwrap();
+
+    let shout = get_shout(&checkin);
+    assert_eq!(
+        shout,
+        Some("with this is a test with Alex, Bob".to_string())
+    );
 }
