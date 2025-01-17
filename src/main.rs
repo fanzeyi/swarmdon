@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
 use axum::routing::post;
 use axum::{routing::get, Router};
 use clap::Parser;
@@ -65,16 +62,6 @@ impl Flags {
     }
 }
 
-fn read_friends_map(path: &Path) -> Result<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path).context("unable to read friends map")?;
-    let mut map = HashMap::new();
-    for line in content.lines() {
-        let (swarm_id, mastodon_id) = line.split_once('=').context("invalid line")?;
-        map.insert(swarm_id.to_string(), mastodon_id.to_string());
-    }
-    Ok(map)
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -84,25 +71,7 @@ async fn main() {
 
     let flags = Flags::parse();
     let address = flags.address.clone();
-    let database = flags.database.clone();
-    let friends_map = if let Some(friends_map) = flags.friends_map.as_ref() {
-        match read_friends_map(friends_map) {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::error!(?e, "unable to read friends map");
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
-
-    let state = Arc::new(AppState {
-        flags,
-        db: model::Database::open(&database).unwrap(),
-        signing_key: simple_cookie::generate_signing_key(),
-        friends_map,
-    });
+    let state = Arc::new(AppState::from_flags(flags));
 
     let app = Router::new()
         .route("/", get(routes::get_home).post(routes::post_home))
