@@ -46,6 +46,10 @@ pub struct Flags {
 
     #[clap(long)]
     friends_map: Option<PathBuf>,
+
+    /// In addition to waiting for pushing from Swarm. Poll the latest checkin as well every 5 minutes
+    #[clap(long, default_value_t = true)]
+    with_polling: bool,
 }
 
 impl Flags {
@@ -71,7 +75,8 @@ async fn main() {
 
     let flags = Flags::parse();
     let address = flags.address.clone();
-    let state = Arc::new(AppState::from_flags(flags));
+    let state = Arc::new(AppState::from_flags(flags).await);
+    let _polling = state.start_polling_task().await;
 
     let app = Router::new()
         .route("/", get(routes::get_home).post(routes::post_home))

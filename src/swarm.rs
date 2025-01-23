@@ -38,6 +38,22 @@ pub async fn swarm_get_me(access_token: &str) -> Result<SwarmUser> {
     Ok(serde_json::from_value(response)?)
 }
 
+pub async fn swarm_get_user_checkins(access_token: &str) -> Result<Vec<SwarmCheckin>> {
+    let mut response = swarm_api(format!("/users/self/checkins"), access_token)
+        .await
+        .with_context(|| format!("unable to retrieve checkins for the user"))?;
+    let response = response
+        .get_mut("checkins")
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("unable to retrieve checkins for the user"))?
+        .take()
+        .get_mut("items")
+        .ok_or_else(|| anyhow::anyhow!("unable to retrieve checkins for the user"))?
+        .take();
+
+    Ok(serde_json::from_value(response)?)
+}
+
 #[derive(Deserialize, Debug)]
 pub struct SwarmLocation {
     country: Option<String>,
@@ -73,7 +89,7 @@ pub struct SwarmCheckin {
     pub r#type: String,
     pub private: Option<bool>,
     pub shout: Option<String>,
-    pub user: SwarmUser,
+    pub user: Option<SwarmUser>,
     pub venue: SwarmVenue,
     #[serde(default)]
     pub with: Vec<SwarmUser>,

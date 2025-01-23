@@ -10,7 +10,6 @@ use axum::response::Html;
 use axum::TypedHeader;
 use axum::{extract::State, response::Redirect, Form};
 use http::HeaderValue;
-use mastodon_async::NewStatus;
 use mastodon_async::{apps::AppBuilder, registration::Registered, Registration};
 use serde::Deserialize;
 use simple_cookie::decode_cookie;
@@ -280,56 +279,24 @@ pub async fn post_swarm_push(
         tracing::info!(checkin=%checkin.id, "checkin is private, skip posting.");
         return Ok(());
     }
-    let Ok(Some(user_id)) = state.db.swarm_mapping.get(&checkin.user.id) else {
-        tracing::warn!(
-            user_id = checkin.user.id,
-            "received push event for unknown user"
-        );
+    let Some(user) = &checkin.user else {
+        tracing::warn!(?checkin, "received push event without an user");
         return Ok(());
     };
-    let Ok(Some(user)) = state.db.get_user(String::from_utf8_lossy(&user_id)) else {
-        tracing::warn!(
-            user_id = checkin.user.id,
-            "received push event for unknown user"
-        );
+    let Ok(Some(user_id)) = state.db.swarm_mapping.get(&user.id) else {
+        tracing::warn!(user_id = user.id, "received push event for unknown user");
         return Ok(());
     };
-    let mastodon = user.get_mastodon();
-
-    let country = checkin
-        .venue
-        .location
-        .to_string()
-        .map(|c| format!(" in {}", c))
-        .unwrap_or_default();
-
-    let details =
-        match crate::swarm::get_checkin_details(&user.swarm_access_token, &checkin.id).await {
-            Ok(details) => details,
-            Err(e) => {
-                tracing::warn!(?checkin, ?e, "unable to retrieve checkin details");
-                return Ok(());
-            }
-        };
-
-    let url = details.checkin_short_url;
-    let status = if let Some(shout) = crate::swarm::get_shout(&checkin, &state.friends_map) {
-        format!("{} (@ {}{}) {}", shout, checkin.venue.name, country, url)
-    } else {
-        tracing::info!("no shout for checkin {}, skip posting.", checkin.id);
+    let user_id = String::from_utf8_lossy(&user_id);
+    let Ok(Some(user)) = state.db.get_user(&user_id) else {
+        tracing::warn!(user_id = user.id, "received push event for unknown user");
         return Ok(());
     };
-
-    tracing::debug!(checkin=%checkin.id, %status, "posting status");
-
-    if let Err(e) = mastodon
-        .new_status(NewStatus {
-            status: Some(status),
-            ..Default::default()
-        })
-        .await
-    {
-        tracing::warn!("unable to post status: {}", e);
+    if let Err(e) = user.post_checkin(&checkin, &state.friends_map).await {
+        tracing::warn!(?e, checkin=%checkin.id, "unable to post checkin");
+        return Ok(());
     }
+    tracing::info!(checkin_id = checkin.id, "status posted");
+    state.update_last_checkin(&user_id, &checkin.id).await;
     Ok(())
 }

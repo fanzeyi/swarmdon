@@ -1,15 +1,23 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use arbitrary::Arbitrary;
+use arbitrary::Unstructured;
 use mastodon_async::registration::Registered;
 use mastodon_async::Data;
 use mastodon_async::Mastodon;
+use mastodon_async::NewStatus;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::swarm::SwarmCheckin;
+
+#[derive(Clone)]
 pub struct Database {
+    #[allow(dead_code)]
     db: sled::Db,
     pub registration: sled::Tree,
     pub user: sled::Tree,
@@ -68,6 +76,19 @@ impl Database {
         )?;
         Ok(user)
     }
+
+    pub fn get_users(&self) -> Result<HashMap<String, User>> {
+        self.user
+            .iter()
+            .map(|x| {
+                let x = x?;
+                Ok((
+                    String::from_utf8(x.0.to_vec())?,
+                    bincode::deserialize(&x.1)?,
+                ))
+            })
+            .collect()
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -107,15 +128,126 @@ impl From<Registered> for AppRegistration {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Arbitrary)]
 pub struct User {
+    #[arbitrary(with = arbitrary_mastodon_data)]
     pub mastodon: Data,
     pub swarm_id: String,
     pub swarm_access_token: String,
+}
+
+fn arbitrary_mastodon_data(u: &mut Unstructured) -> arbitrary::Result<Data> {
+    Ok(Data {
+        base: u.arbitrary::<String>()?.into(),
+        client_id: u.arbitrary::<String>()?.into(),
+        client_secret: u.arbitrary::<String>()?.into(),
+        redirect: u.arbitrary::<String>()?.into(),
+        token: u.arbitrary::<String>()?.into(),
+    })
 }
 
 impl User {
     pub fn get_mastodon(&self) -> Mastodon {
         self.mastodon.clone().into()
     }
+
+    pub async fn get_latest_checkins(&self) -> Result<Vec<SwarmCheckin>> {
+        let checkins = crate::swarm::swarm_get_user_checkins(&self.swarm_access_token).await?;
+        Ok(checkins
+            .into_iter()
+            // .filter(|c| !c.private.unwrap_or_default())
+            .collect())
+    }
+
+    pub async fn get_last_checkin(&self) -> Result<String> {
+        Ok(self
+            .get_latest_checkins()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no checkins found for user {}", self.swarm_id))?
+            .id)
+    }
+
+    pub async fn post_checkin(
+        &self,
+        checkin: &SwarmCheckin,
+        friends_map: &HashMap<String, String>,
+    ) -> Result<()> {
+        let mastodon = self.get_mastodon();
+
+        let country = checkin
+            .venue
+            .location
+            .to_string()
+            .map(|c| format!(" in {}", c))
+            .unwrap_or_default();
+
+        let details =
+            match crate::swarm::get_checkin_details(&self.swarm_access_token, &checkin.id).await {
+                Ok(details) => details,
+                Err(e) => {
+                    tracing::warn!(?checkin, ?e, "unable to retrieve checkin details");
+                    return Ok(());
+                }
+            };
+
+        let url = details.checkin_short_url;
+        let status = if let Some(shout) = crate::swarm::get_shout(&checkin, &friends_map) {
+            format!("{} (@ {}{}) {}", shout, checkin.venue.name, country, url)
+        } else {
+            tracing::info!("no shout for checkin {}, skip posting.", checkin.id);
+            return Ok(());
+        };
+
+        tracing::debug!(checkin=%checkin.id, %status, "posting status");
+
+        if let Err(e) = mastodon
+            .new_status(NewStatus {
+                status: Some(status),
+                ..Default::default()
+            })
+            .await
+        {
+            tracing::warn!("unable to post status: {}", e);
+        }
+
+        Ok(())
+    }
+}
+
+#[test]
+fn test_get_users() {
+    arbtest::arbtest(|u| {
+        let id1 = "https://example.com:1";
+        let id2 = "https://example.com:2";
+        let id3 = "https://example.com:3";
+        let user1: User = u.arbitrary()?;
+        let user2: User = u.arbitrary()?;
+        let user3: User = u.arbitrary()?;
+        let db = Database::open("test.db").unwrap();
+        db.user.clear().unwrap();
+        db.user
+            .insert(id1, bincode::serialize(&user1).unwrap())
+            .unwrap();
+        db.user
+            .insert(id2, bincode::serialize(&user2).unwrap())
+            .unwrap();
+        db.user
+            .insert(id3, bincode::serialize(&user3).unwrap())
+            .unwrap();
+
+        let users = db.get_users().unwrap();
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[id1].mastodon, user1.mastodon);
+        assert_eq!(users[id1].swarm_id, user1.swarm_id);
+        assert_eq!(users[id1].swarm_access_token, user1.swarm_access_token);
+        assert_eq!(users[id2].mastodon, user2.mastodon);
+        assert_eq!(users[id2].swarm_id, user2.swarm_id);
+        assert_eq!(users[id2].swarm_access_token, user2.swarm_access_token);
+        assert_eq!(users[id3].mastodon, user3.mastodon);
+        assert_eq!(users[id3].swarm_id, user3.swarm_id);
+        assert_eq!(users[id3].swarm_access_token, user3.swarm_access_token);
+        Ok(())
+    });
 }
