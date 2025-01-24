@@ -155,7 +155,7 @@ impl User {
         let checkins = crate::swarm::swarm_get_user_checkins(&self.swarm_access_token).await?;
         Ok(checkins
             .into_iter()
-            // .filter(|c| !c.private.unwrap_or_default())
+            .filter(|c| !c.private.unwrap_or_default())
             .collect())
     }
 
