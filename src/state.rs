@@ -1,20 +1,28 @@
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use mastodon_async::apps::App;
+use mastodon_async::apps::AppBuilder;
+use mastodon_async::scopes::Read;
+use mastodon_async::scopes::Scopes;
+use mastodon_async::scopes::Write;
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::model::Database;
+use crate::swarm::SwarmApi;
 use crate::Flags;
 
 pub struct AppState {
-    pub flags: crate::Flags,
+    pub swarm: SwarmApi,
+    pub swarm_push_secret: String,
     pub db: crate::model::Database,
     pub signing_key: [u8; 32],
     pub friends_map: HashMap<String, String>,
     pub last_checkin: Option<Mutex<HashMap<String, String>>>,
+    pub app_builder: AppBuilder<'static>,
 }
 
 fn read_friends_map(path: &Path) -> Result<HashMap<String, String>> {
@@ -35,9 +43,12 @@ impl AppState {
 
         users
             .into_iter()
-            .map(|(id, user)| async move {
-                let last_checkin = user.get_last_checkin().await?;
-                Ok((id, last_checkin))
+            .map(|(id, user)| {
+                let swarm = user.get_swarm();
+                async move {
+                    let last_checkin = swarm.get_last_checkin(&user.swarm_id).await?;
+                    Ok((id, last_checkin))
+                }
             })
             .collect::<JoinSet<_>>()
             .join_all()
@@ -49,6 +60,18 @@ impl AppState {
     pub async fn from_flags(flags: Flags) -> Self {
         let database = flags.database.clone();
         let db = Database::open(&database).unwrap();
+        let swarm = SwarmApi::new(
+            flags.swarm_client_id,
+            flags.swarm_client_secret,
+            format!("{}/swarm/callback", flags.base_url)
+                .parse()
+                .expect("invalid swarm callback url"),
+        );
+        let mut app_builder = App::builder();
+        app_builder
+            .client_name(flags.client_name.clone())
+            .redirect_uris(format!("{}/mastodon/callback", flags.base_url))
+            .scopes(Scopes::write(Write::Statuses) | Scopes::read(Read::Accounts));
         let friends_map = if let Some(friends_map) = flags.friends_map.as_ref() {
             match read_friends_map(friends_map) {
                 Ok(map) => map,
@@ -74,11 +97,13 @@ impl AppState {
         tracing::debug!(?last_checkin, "last checkin");
 
         AppState {
-            flags,
+            swarm,
+            swarm_push_secret: flags.swarm_push_secret,
             db,
             signing_key: simple_cookie::generate_signing_key(),
             friends_map,
             last_checkin,
+            app_builder,
         }
     }
 
@@ -117,7 +142,8 @@ impl AppState {
                                     .get_user(&id)
                                     .context("unable to get user")?
                                     .ok_or_else(|| anyhow!("user not found"))?;
-                                let checkins = user
+                                let swarm = user.get_swarm();
+                                let checkins = swarm
                                     .get_latest_checkins()
                                     .await
                                     .context("unable to get latest checkins")?;

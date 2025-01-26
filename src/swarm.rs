@@ -1,7 +1,143 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use url::Url;
+
+#[derive(Clone)]
+pub struct SwarmApi {
+    client_id: String,
+    client_secret: String,
+    callback_url: Url,
+}
+
+impl SwarmApi {
+    pub fn new(client_id: String, client_secret: String, callback_url: Url) -> Self {
+        Self {
+            client_id,
+            client_secret,
+            callback_url,
+        }
+    }
+
+    pub fn get_authenticate_url(&self) -> Url {
+        Url::parse_with_params(
+            "https://foursquare.com/oauth2/authenticate",
+            &[
+                ("client_id", self.client_id.as_str()),
+                ("response_type", "code"),
+                ("redirect_uri", self.callback_url.as_str()),
+            ],
+        )
+        .expect("invalid swarm url")
+    }
+
+    pub async fn get_access_token(&self, code: &str) -> Result<SwarmUserApi> {
+        let access_token_url = Url::parse_with_params(
+            "https://foursquare.com/oauth2/access_token",
+            &[
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", self.callback_url.as_str()),
+                ("code", code),
+            ],
+        )
+        .expect("invalid swarm url");
+
+        let response = reqwest::get(access_token_url).await?;
+        let response = response.json::<serde_json::Value>().await?;
+        let access_token = response
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("unable to retrieve access token for swarm"))?;
+
+        Ok(SwarmUserApi::new(access_token.to_string()))
+    }
+}
+
+pub struct SwarmUserApi {
+    pub access_token: String,
+}
+
+impl SwarmUserApi {
+    pub fn new(access_token: String) -> Self {
+        Self { access_token }
+    }
+
+    async fn swarm_api(&self, method: String) -> Result<serde_json::Value> {
+        let url = format!(
+            "https://api.foursquare.com/v2{}?v=20220722&oauth_token={}",
+            method, self.access_token
+        );
+
+        let response = reqwest::get(url).await?;
+        let mut response = response.json::<serde_json::Value>().await?;
+        let Some(response) = response.get_mut("response").map(|v| v.take()) else {
+            return Err(anyhow::anyhow!("unable to retrieve response for swarm"));
+        };
+        Ok(response)
+    }
+
+    pub async fn get_me(&self) -> Result<SwarmUser> {
+        let mut response = self
+            .swarm_api(format!("/users/self"))
+            .await
+            .with_context(|| format!("unable to retrieve information about the user"))?;
+        let response = response
+            .get_mut("user")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("unable to retrieve user info for swarm"))?
+            .take();
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn get_checkins(&self) -> Result<Vec<SwarmCheckin>> {
+        let mut response = self
+            .swarm_api(format!("/users/self/checkins"))
+            .await
+            .with_context(|| format!("unable to retrieve checkins for the user"))?;
+        let response = response
+            .get_mut("checkins")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("unable to retrieve checkins for the user"))?
+            .take()
+            .get_mut("items")
+            .ok_or_else(|| anyhow::anyhow!("unable to retrieve checkins for the user"))?
+            .take();
+
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn get_checkin_details(&self, checkin_id: &str) -> Result<SwarmCheckinDetail> {
+        let mut response = self.swarm_api(format!("/checkins/{}", checkin_id)).await?;
+        let response = response
+            .get_mut("checkin")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("response from Swarm API does not contain checkin"))?
+            .take();
+
+        Ok(serde_json::from_value(response)?)
+    }
+
+    pub async fn get_latest_checkins(&self) -> Result<Vec<SwarmCheckin>> {
+        let checkins = self.get_checkins().await?;
+        Ok(checkins
+            .into_iter()
+            .filter(|c| !c.private.unwrap_or_default())
+            .collect())
+    }
+
+    pub async fn get_last_checkin(&self, swarm_id: &str) -> Result<String> {
+        Ok(self
+            .get_latest_checkins()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no checkins found for user {}", swarm_id))?
+            .id)
+    }
+}
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -10,48 +146,6 @@ pub struct SwarmUser {
     pub first_name: String,
     pub last_name: String,
     pub handle: String,
-}
-
-pub async fn swarm_api(method: String, access_token: &str) -> Result<serde_json::Value> {
-    let url = format!(
-        "https://api.foursquare.com/v2{}?v=20220722&oauth_token={}",
-        method, access_token
-    );
-
-    let response = reqwest::get(url).await?;
-    let mut response = response.json::<serde_json::Value>().await?;
-    let Some(response) = response.get_mut("response").map(|v| v.take()) else {
-        return Err(anyhow::anyhow!("unable to retrieve response for swarm"));
-    };
-    Ok(response)
-}
-
-pub async fn swarm_get_me(access_token: &str) -> Result<SwarmUser> {
-    let mut response = swarm_api(format!("/users/self"), access_token)
-        .await
-        .with_context(|| format!("unable to retrieve information about the user"))?;
-    let response = response
-        .get_mut("user")
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("unable to retrieve user info for swarm"))?
-        .take();
-    Ok(serde_json::from_value(response)?)
-}
-
-pub async fn swarm_get_user_checkins(access_token: &str) -> Result<Vec<SwarmCheckin>> {
-    let mut response = swarm_api(format!("/users/self/checkins"), access_token)
-        .await
-        .with_context(|| format!("unable to retrieve checkins for the user"))?;
-    let response = response
-        .get_mut("checkins")
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("unable to retrieve checkins for the user"))?
-        .take()
-        .get_mut("items")
-        .ok_or_else(|| anyhow::anyhow!("unable to retrieve checkins for the user"))?
-        .take();
-
-    Ok(serde_json::from_value(response)?)
 }
 
 #[derive(Deserialize, Debug)]
@@ -108,20 +202,6 @@ pub struct SwarmCheckinDetail {
 pub struct SwarmPush {
     pub checkin: String,
     pub secret: String,
-}
-
-pub async fn get_checkin_details(
-    access_token: &str,
-    checkin_id: &str,
-) -> Result<SwarmCheckinDetail> {
-    let mut response = swarm_api(format!("/checkins/{}", checkin_id), access_token).await?;
-    let response = response
-        .get_mut("checkin")
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("response from Swarm API does not contain checkin"))?
-        .take();
-
-    Ok(serde_json::from_value(response)?)
 }
 
 pub fn get_shout(checkin: &SwarmCheckin, friends_map: &HashMap<String, String>) -> Option<String> {

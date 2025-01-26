@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::swarm::SwarmCheckin;
+use crate::swarm::SwarmUserApi;
 
 #[derive(Clone)]
 pub struct Database {
@@ -151,22 +152,8 @@ impl User {
         self.mastodon.clone().into()
     }
 
-    pub async fn get_latest_checkins(&self) -> Result<Vec<SwarmCheckin>> {
-        let checkins = crate::swarm::swarm_get_user_checkins(&self.swarm_access_token).await?;
-        Ok(checkins
-            .into_iter()
-            .filter(|c| !c.private.unwrap_or_default())
-            .collect())
-    }
-
-    pub async fn get_last_checkin(&self) -> Result<String> {
-        Ok(self
-            .get_latest_checkins()
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no checkins found for user {}", self.swarm_id))?
-            .id)
+    pub fn get_swarm(&self) -> SwarmUserApi {
+        SwarmUserApi::new(self.swarm_access_token.clone())
     }
 
     pub async fn post_checkin(
@@ -175,6 +162,7 @@ impl User {
         friends_map: &HashMap<String, String>,
     ) -> Result<()> {
         let mastodon = self.get_mastodon();
+        let swarm = self.get_swarm();
 
         let country = checkin
             .venue
@@ -183,14 +171,13 @@ impl User {
             .map(|c| format!(" in {}", c))
             .unwrap_or_default();
 
-        let details =
-            match crate::swarm::get_checkin_details(&self.swarm_access_token, &checkin.id).await {
-                Ok(details) => details,
-                Err(e) => {
-                    tracing::warn!(?checkin, ?e, "unable to retrieve checkin details");
-                    return Ok(());
-                }
-            };
+        let details = match swarm.get_checkin_details(&checkin.id).await {
+            Ok(details) => details,
+            Err(e) => {
+                tracing::warn!(?checkin, ?e, "unable to retrieve checkin details");
+                return Ok(());
+            }
+        };
 
         let url = details.checkin_short_url;
         let status = if let Some(shout) = crate::swarm::get_shout(&checkin, &friends_map) {

@@ -65,7 +65,7 @@ pub async fn post_home(
     }
 
     let registered =
-        get_or_create_registration(&state.db, state.flags.app_builder(), instance_url.clone())
+        get_or_create_registration(&state.db, &state.app_builder, instance_url.clone())
             .await
             .from_err()?;
 
@@ -163,47 +163,8 @@ pub async fn get_swarm(
         return Err("invalid user".into());
     };
 
-    let mut url =
-        Url::parse("https://foursquare.com/oauth2/authenticate").expect("invalid swarm url");
-    let mut queries = url.query_pairs_mut();
-
-    queries.append_pair("client_id", &state.flags.swarm_client_id);
-    queries.append_pair("response_type", "code");
-    queries.append_pair(
-        "redirect_uri",
-        &format!("{}/swarm/callback", state.flags.base_url),
-    );
-    drop(queries);
-
-    Ok(Redirect::to(&url.to_string()))
-}
-
-async fn swarm_get_access_token(
-    client_id: &str,
-    client_secret: &str,
-    redirect_url: &str,
-    code: &str,
-) -> Result<String> {
-    let mut url =
-        Url::parse("https://foursquare.com/oauth2/access_token").expect("invalid swarm url");
-
-    {
-        let mut queries = url.query_pairs_mut();
-        queries.append_pair("client_id", client_id);
-        queries.append_pair("client_secret", client_secret);
-        queries.append_pair("grant_type", "authorization_code");
-        queries.append_pair("redirect_uri", redirect_url);
-        queries.append_pair("code", code);
-    }
-
-    let response = reqwest::get(url).await?;
-    let response = response.json::<serde_json::Value>().await?;
-    let access_token = response
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("unable to retrieve access token for swarm"))?;
-
-    Ok(access_token.to_string())
+    let url = state.swarm.get_authenticate_url();
+    Ok(Redirect::to(url.as_str()))
 }
 
 pub async fn get_swarm_callback(
@@ -224,20 +185,11 @@ pub async fn get_swarm_callback(
         return Err("invalid user".into());
     };
 
-    let access_token = swarm_get_access_token(
-        &state.flags.swarm_client_id,
-        &state.flags.swarm_client_secret,
-        &format!("{}/swarm/callback", state.flags.base_url),
-        code,
-    )
-    .await
-    .from_err()?;
-    tracing::debug!(?access_token, "swarm access token");
-
-    let swarm_user = crate::swarm::swarm_get_me(&access_token).await.from_err()?;
+    let user_api = state.swarm.get_access_token(code).await.from_err()?;
+    let swarm_user = user_api.get_me().await.from_err()?;
     tracing::debug!(?swarm_user, "swarm user");
     user.swarm_id = swarm_user.id.clone();
-    user.swarm_access_token = access_token;
+    user.swarm_access_token = user_api.access_token.clone();
     state
         .db
         .user
@@ -263,7 +215,7 @@ pub async fn post_swarm_push(
     Form(SwarmPush { checkin, secret }): Form<SwarmPush>,
 ) -> Result<(), String> {
     tracing::debug!(%checkin, "received push event");
-    if secret != state.flags.swarm_push_secret {
+    if secret != state.swarm_push_secret {
         tracing::warn!(%checkin, "received invalid push event");
         return Ok(());
     }

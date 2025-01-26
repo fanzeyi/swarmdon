@@ -3,12 +3,6 @@ use std::{path::PathBuf, sync::Arc};
 use axum::routing::post;
 use axum::{routing::get, Router};
 use clap::Parser;
-use mastodon_async::scopes::Read;
-use mastodon_async::{
-    apps::{App, AppBuilder},
-    scopes::{Scopes, Write},
-};
-use once_cell::sync::OnceCell;
 use state::AppState;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -50,20 +44,6 @@ pub struct Flags {
     /// In addition to waiting for pushing from Swarm. Poll the latest checkin as well every 5 minutes
     #[clap(long, default_value_t = true)]
     with_polling: bool,
-}
-
-impl Flags {
-    fn app_builder(&self) -> &'static AppBuilder<'static> {
-        static APP: OnceCell<AppBuilder> = OnceCell::new();
-        APP.get_or_init(|| {
-            let mut builder = App::builder();
-            builder
-                .client_name(self.client_name.clone())
-                .redirect_uris(format!("{}/mastodon/callback", self.base_url))
-                .scopes(Scopes::write(Write::Statuses) | Scopes::read(Read::Accounts));
-            builder
-        })
-    }
 }
 
 #[tokio::main]
